@@ -6,7 +6,12 @@
 
 ## Description
 
-This `acts_as` extension provides the capabilities for sorting and reordering a number of objects in a list. The class that has this specified needs to have a `position` column defined as an integer on the mapped database table.
+This is a forked version of [swanandp/acts_as_list](https://github.com/swanandp/acts_as_list). It adds the ability to ignore the default `type` scoping applied to ActiveRecord queries when using single table inheritance models.
+
+To use, simply pass:
+```ruby
+acts_as_list ignore_sti: true
+```
 
 ## 0.8.0 Upgrade Notes
 
