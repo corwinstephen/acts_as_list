@@ -10,8 +10,8 @@ task default: :test
 
 desc "Test the acts_as_list plugin."
 Rake::TestTask.new(:test) do |t|
-  t.libs << "lib" << "test"
-  t.pattern = "test/**/test_*.rb"
+  t.libs << "test" << "."
+  t.test_files = Rake::FileList["test/**/test_*.rb"]
   t.verbose = false
 end
 
@@ -31,4 +31,12 @@ rescue LoadError
   puts "RDocTask is not supported on this platform."
 rescue StandardError
   puts "RDocTask is not supported on this platform."
+end
+
+# See https://github.com/skywinder/github-changelog-generator#rake-task for details
+# and github_changelog_generator --help for available options
+require 'github_changelog_generator/task'
+GitHubChangelogGenerator::RakeTask.new :changelog do |config|
+  config.project = 'acts_as_list'
+  config.user = 'swanandp'
 end

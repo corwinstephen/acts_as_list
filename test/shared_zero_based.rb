@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 module Shared
   module ZeroBased
     def setup
@@ -14,6 +16,11 @@ module Shared
       assert_equal 1, new.pos
       assert !new.first?
       assert new.last?
+
+      new = ZeroBasedMixin.acts_as_list_no_update { ZeroBasedMixin.create(parent_id: 20) }
+      assert_equal_or_nil $default_position, new.pos
+      assert !new.first?
+      assert !new.last?
 
       new = ZeroBasedMixin.create(parent_id: 20)
       assert_equal 2, new.pos
@@ -63,6 +70,9 @@ module Shared
       new = ZeroBasedMixin.create(parent_id: 20)
       assert_equal 2, new.pos
 
+      new_noup = ZeroBasedMixin.acts_as_list_no_update { ZeroBasedMixin.create(parent_id: 20) }
+      assert_equal_or_nil $default_position, new_noup.pos
+
       new4 = ZeroBasedMixin.create(parent_id: 20)
       assert_equal 3, new4.pos
 
@@ -86,6 +96,9 @@ module Shared
 
       new4.reload
       assert_equal 4, new4.pos
+
+      new_noup.reload
+      assert_equal_or_nil $default_position, new_noup.pos
     end
   end
 end

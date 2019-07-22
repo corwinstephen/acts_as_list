@@ -1,13 +1,17 @@
+# frozen_string_literal: true
+
 # NOTE: following now done in helper.rb (better Readability)
 require 'helper'
 
-ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:")
-ActiveRecord::Schema.verbose = false
-
 def setup_db(position_options = {})
+  $default_position = position_options[:default]
+
+  # sqlite cannot drop/rename/alter columns and add constraints after table creation
+  sqlite = ENV.fetch("DB", "sqlite") == "sqlite"
+
   # AR caches columns options like defaults etc. Clear them!
   ActiveRecord::Base.connection.create_table :mixins do |t|
-    t.column :pos, :integer, position_options
+    t.column :pos, :integer, position_options unless position_options[:positive] && sqlite
     t.column :active, :boolean, default: true
     t.column :parent_id, :integer
     t.column :parent_type, :string
@@ -16,9 +20,37 @@ def setup_db(position_options = {})
     t.column :state, :integer
   end
 
+  if position_options[:unique] && !(sqlite && position_options[:positive])
+    ActiveRecord::Base.connection.add_index :mixins, :pos, unique: true
+  end
+
+  if position_options[:positive]
+    if sqlite
+      # SQLite cannot add constraint after table creation, also cannot add unique inside ADD COLUMN
+      ActiveRecord::Base.connection.execute('ALTER TABLE mixins ADD COLUMN pos integer8 NOT NULL CHECK (pos > 0) DEFAULT 1')
+      ActiveRecord::Base.connection.execute('CREATE UNIQUE INDEX index_mixins_on_pos ON mixins(pos)')
+    else
+      ActiveRecord::Base.connection.execute('ALTER TABLE mixins ADD CONSTRAINT pos_check CHECK (pos > 0)')
+    end
+  end
+
+  # This table is used to test table names and column names quoting
+  ActiveRecord::Base.connection.create_table 'table-name' do |t|
+    t.column :order, :integer
+  end
+
+  # This table is used to test table names with different primary_key columns
+  ActiveRecord::Base.connection.create_table 'altid-table', primary_key: 'altid' do |t|
+    t.column :pos, :integer
+    t.column :created_at, :datetime
+    t.column :updated_at, :datetime
+  end
+
+  ActiveRecord::Base.connection.add_index 'altid-table', :pos, unique: true
+
   mixins = [ Mixin, ListMixin, ListMixinSub1, ListMixinSub2, ListWithStringScopeMixin,
     ArrayScopeListMixin, ZeroBasedMixin, DefaultScopedMixin,
-    DefaultScopedWhereMixin, TopAdditionMixin, NoAdditionMixin ]
+    DefaultScopedWhereMixin, TopAdditionMixin, NoAdditionMixin, QuotedList, TouchDisabledMixin ]
 
   mixins << EnumArrayScopeListMixin if rails_4
 
@@ -32,27 +64,16 @@ def setup_db_with_default
   setup_db default: 0
 end
 
-# Returns true if ActiveRecord is rails3,4 version
-def rails_3
-  defined?(ActiveRecord::VERSION) && ActiveRecord::VERSION::MAJOR >= 3
-end
-
-def rails_4
-  defined?(ActiveRecord::VERSION) && ActiveRecord::VERSION::MAJOR >= 4
-end
-
-def teardown_db
-  ActiveRecord::Base.connection.tables.each do |table|
-    ActiveRecord::Base.connection.drop_table(table)
-  end
-end
-
 class Mixin < ActiveRecord::Base
   self.table_name = 'mixins'
 end
 
 class ListMixin < Mixin
   acts_as_list column: "pos", scope: :parent
+end
+
+class TouchDisabledMixin < Mixin
+  acts_as_list column: "pos", touch_on_update: false
 end
 
 class ListMixinSub1 < ListMixin
@@ -66,12 +87,24 @@ class ListMixinSub2 < ListMixin
   end
 end
 
+class ListMixinError < ListMixin
+  if rails_3
+    validates :state, presence: true
+  else
+    validates_presence_of :state
+  end
+end
+
 class ListWithStringScopeMixin < Mixin
   acts_as_list column: "pos", scope: 'parent_id = #{parent_id}'
 end
 
 class ArrayScopeListMixin < Mixin
   acts_as_list column: "pos", scope: [:parent_id, :parent_type]
+end
+
+class ArrayScopeListWithHashMixin < Mixin
+  acts_as_list column: "pos", scope: [:parent_id, state: nil]
 end
 
 if rails_4
@@ -97,8 +130,33 @@ class DefaultScopedWhereMixin < Mixin
   default_scope { order('pos ASC').where(active: true) }
 
   def self.for_active_false_tests
-    unscoped.order('pos ASC').where(active: false)
+    if ActiveRecord::VERSION::MAJOR < 4
+      unscoped do
+        order('pos ASC').where(active: false)
+      end
+    else
+      unscope(:where).where(active: false)
+    end
   end
+end
+
+class SequentialUpdatesDefault < Mixin
+  acts_as_list column: "pos"
+end
+
+class SequentialUpdatesAltId < ActiveRecord::Base
+  self.table_name = "altid-table"
+  self.primary_key = "altid"
+
+  acts_as_list column: "pos"
+end
+
+class SequentialUpdatesAltIdTouchDisabled < SequentialUpdatesAltId
+  acts_as_list column: "pos", touch_on_update: false
+end
+
+class SequentialUpdatesFalseMixin < Mixin
+  acts_as_list column: "pos", sequential_updates: false
 end
 
 class TopAdditionMixin < Mixin
@@ -107,6 +165,29 @@ end
 
 class NoAdditionMixin < Mixin
   acts_as_list column: "pos", add_new_at: nil, scope: :parent_id
+end
+
+##
+# The way we track changes to
+# scope and position can get tripped up
+# by someone using update_attributes within
+# a callback because it causes multiple passes
+# through the callback chain
+module CallbackMixin
+
+  def self.included(base)
+    base.send :include, InstanceMethods
+    base.after_create :change_field
+  end
+
+  module InstanceMethods
+    def change_field
+      # doesn't matter what column changes, just
+      # need to change something
+
+      self.update_attributes(active: !self.active)
+    end
+  end
 end
 
 class TheAbstractClass < ActiveRecord::Base
@@ -124,6 +205,11 @@ class TheBaseClass < ActiveRecord::Base
 end
 
 class TheBaseSubclass < TheBaseClass
+end
+
+class QuotedList < ActiveRecord::Base
+  self.table_name = 'table-name'
+  acts_as_list column: :order
 end
 
 class ActsAsListTestCase < Minitest::Test
@@ -161,6 +247,49 @@ class ListTest < ActsAsListTestCase
     setup_db
     super
   end
+
+  def test_insert_race_condition
+    # the bigger n is the more likely we will have a race condition
+    n = 1000
+    (1..n).each do |counter|
+      node = ListMixin.new parent_id: 1
+      node.pos = counter
+      node.save!
+    end
+
+    wait_for_it  = true
+    threads = []
+    4.times do |i|
+      threads << Thread.new do
+        true while wait_for_it
+        ActiveRecord::Base.connection_pool.with_connection do |c|
+          n.times do
+            begin
+              ListMixin.where(parent_id: 1).order('pos').last.insert_at(1)
+            rescue Exception
+              # ignore SQLite3::SQLException due to table locking
+            end
+          end
+        end
+      end
+    end
+    wait_for_it = false
+    threads.each(&:join)
+
+    assert_equal((1..n).to_a, ListMixin.where(parent_id: 1).order('pos').map(&:pos))
+  end
+end
+
+class ListWithCallbackTest < ActsAsListTestCase
+
+  include Shared::List
+
+  def setup
+    ListMixin.send(:include, CallbackMixin)
+    setup_db
+    super
+  end
+
 end
 
 class ListTestWithDefault < ActsAsListTestCase
@@ -208,6 +337,15 @@ class ArrayScopeListTestWithDefault < ActsAsListTestCase
   end
 end
 
+class QuotingTestList < ActsAsListTestCase
+  include Shared::Quoting
+
+  def setup
+    setup_db_with_default
+    super
+  end
+end
+
 class DefaultScopedTest < ActsAsListTestCase
   def setup
     setup_db
@@ -224,6 +362,11 @@ class DefaultScopedTest < ActsAsListTestCase
     assert_equal 6, new.pos
     assert !new.first?
     assert new.last?
+
+    new = DefaultScopedMixin.acts_as_list_no_update { DefaultScopedMixin.create }
+    assert_equal_or_nil $default_position, new.pos
+    assert_equal $default_position.is_a?(Integer), new.first?
+    assert !new.last?
 
     new = DefaultScopedMixin.create
     assert_equal 7, new.pos
@@ -260,6 +403,9 @@ class DefaultScopedTest < ActsAsListTestCase
     new = DefaultScopedMixin.create
     assert_equal 6, new.pos
 
+    new_noup = DefaultScopedMixin.acts_as_list_no_update { DefaultScopedMixin.create }
+    assert_equal_or_nil $default_position, new_noup.pos
+
     new = DefaultScopedMixin.create
     assert_equal 7, new.pos
 
@@ -286,6 +432,9 @@ class DefaultScopedTest < ActsAsListTestCase
 
     new4.reload
     assert_equal 4, new4.pos
+
+    new_noup.reload
+    assert_equal_or_nil $default_position, new_noup.pos
   end
 
   def test_update_position
@@ -317,6 +466,11 @@ class DefaultScopedWhereTest < ActsAsListTestCase
     assert_equal 6, new.pos
     assert !new.first?
     assert new.last?
+
+    new = DefaultScopedWhereMixin.acts_as_list_no_update { DefaultScopedWhereMixin.create }
+    assert_equal_or_nil $default_position, new.pos
+    assert_equal $default_position.is_a?(Integer), new.first?
+    assert !new.last?
 
     new = DefaultScopedWhereMixin.create
     assert_equal 7, new.pos
@@ -356,6 +510,9 @@ class DefaultScopedWhereTest < ActsAsListTestCase
     new = DefaultScopedWhereMixin.create
     assert_equal 7, new.pos
 
+    new_noup = DefaultScopedWhereMixin.acts_as_list_no_update { DefaultScopedWhereMixin.create }
+    assert_equal_or_nil $default_position, new_noup.pos
+
     new4 = DefaultScopedWhereMixin.create
     assert_equal 8, new4.pos
 
@@ -379,6 +536,9 @@ class DefaultScopedWhereTest < ActsAsListTestCase
 
     new4.reload
     assert_equal 4, new4.pos
+
+    new_noup.reload
+    assert_equal_or_nil $default_position, new_noup.pos
   end
 
   def test_update_position
@@ -433,10 +593,20 @@ class MultiDestroyTest < ActsAsListTestCase
     new3 = DefaultScopedMixin.create
     assert_equal 3, new3.pos
 
+    new4 = DefaultScopedMixin.create
+    assert_equal 4, new4.pos
+
     new1.destroy
     new2.destroy
     new3.reload
+    new4.reload
     assert_equal 1, new3.pos
+    assert_equal 2, new4.pos
+
+    DefaultScopedMixin.acts_as_list_no_update { new3.destroy }
+
+    new4.reload
+    assert_equal 2, new4.pos
   end
 end
 
@@ -477,19 +647,19 @@ class MultipleListsTest < ActsAsListTestCase
   end
 
   def test_check_scope_order
-    assert_equal [1, 2, 3, 4], ListMixin.where(:parent_id => 1).order(:pos).map(&:id)
-    assert_equal [5, 6, 7, 8], ListMixin.where(:parent_id => 2).order(:pos).map(&:id)
+    assert_equal [1, 2, 3, 4], ListMixin.where(:parent_id => 1).order('pos').map(&:id)
+    assert_equal [5, 6, 7, 8], ListMixin.where(:parent_id => 2).order('pos').map(&:id)
     ListMixin.find(4).update_attributes(:parent_id => 2, :pos => 2)
-    assert_equal [1, 2, 3], ListMixin.where(:parent_id => 1).order(:pos).map(&:id)
-    assert_equal [5, 4, 6, 7, 8], ListMixin.where(:parent_id => 2).order(:pos).map(&:id)
+    assert_equal [1, 2, 3], ListMixin.where(:parent_id => 1).order('pos').map(&:id)
+    assert_equal [5, 4, 6, 7, 8], ListMixin.where(:parent_id => 2).order('pos').map(&:id)
   end
 
   def test_check_scope_position
     assert_equal [1, 2, 3, 4], ListMixin.where(:parent_id => 1).map(&:pos)
     assert_equal [1, 2, 3, 4], ListMixin.where(:parent_id => 2).map(&:pos)
     ListMixin.find(4).update_attributes(:parent_id => 2, :pos => 2)
-    assert_equal [1, 2, 3], ListMixin.where(:parent_id => 1).order(:pos).map(&:pos)
-    assert_equal [1, 2, 3, 4, 5], ListMixin.where(:parent_id => 2).order(:pos).map(&:pos)
+    assert_equal [1, 2, 3], ListMixin.where(:parent_id => 1).order('pos').map(&:pos)
+    assert_equal [1, 2, 3, 4, 5], ListMixin.where(:parent_id => 2).order('pos').map(&:pos)
   end
 end
 
@@ -509,6 +679,12 @@ if rails_4
       assert_equal [1], EnumArrayScopeListMixin.where(:parent_id => 2, :state => EnumArrayScopeListMixin.states['active']).map(&:pos)
       assert_equal [1], EnumArrayScopeListMixin.where(:parent_id => 2, :state => EnumArrayScopeListMixin.states['archived']).map(&:pos)
     end
+
+    def test_update_state
+      active_item = EnumArrayScopeListMixin.find_by(:parent_id => 2, :state => EnumArrayScopeListMixin.states['active'])
+      active_item.update(state: EnumArrayScopeListMixin.states['archived'])
+      assert_equal [1, 2], EnumArrayScopeListMixin.where(:parent_id => 2, :state => EnumArrayScopeListMixin.states['archived']).map(&:pos).sort
+    end
   end
 end
 
@@ -521,50 +697,387 @@ class MultipleListsArrayScopeTest < ActsAsListTestCase
   end
 
   def test_order_after_all_scope_properties_are_changed
-    assert_equal [1, 2, 3, 4], ArrayScopeListMixin.where(:parent_id => 1, :parent_type => 'anything').order(:pos).map(&:id)
-    assert_equal [5, 6, 7, 8], ArrayScopeListMixin.where(:parent_id => 2, :parent_type => 'something').order(:pos).map(&:id)
+    assert_equal [1, 2, 3, 4], ArrayScopeListMixin.where(:parent_id => 1, :parent_type => 'anything').order('pos').map(&:id)
+    assert_equal [5, 6, 7, 8], ArrayScopeListMixin.where(:parent_id => 2, :parent_type => 'something').order('pos').map(&:id)
     ArrayScopeListMixin.find(2).update_attributes(:parent_id => 2, :pos => 2,:parent_type => 'something')
-    assert_equal [1, 3, 4], ArrayScopeListMixin.where(:parent_id => 1,:parent_type => 'anything').order(:pos).map(&:id)
-    assert_equal [5, 2, 6, 7, 8], ArrayScopeListMixin.where(:parent_id => 2,:parent_type => 'something').order(:pos).map(&:id)
+    assert_equal [1, 3, 4], ArrayScopeListMixin.where(:parent_id => 1,:parent_type => 'anything').order('pos').map(&:id)
+    assert_equal [5, 2, 6, 7, 8], ArrayScopeListMixin.where(:parent_id => 2,:parent_type => 'something').order('pos').map(&:id)
   end
 
   def test_position_after_all_scope_properties_are_changed
     assert_equal [1, 2, 3, 4], ArrayScopeListMixin.where(:parent_id => 1, :parent_type => 'anything').map(&:pos)
     assert_equal [1, 2, 3, 4], ArrayScopeListMixin.where(:parent_id => 2, :parent_type => 'something').map(&:pos)
     ArrayScopeListMixin.find(4).update_attributes(:parent_id => 2, :pos => 2, :parent_type => 'something')
-    assert_equal [1, 2, 3], ArrayScopeListMixin.where(:parent_id => 1, :parent_type => 'anything').order(:pos).map(&:pos)
-    assert_equal [1, 2, 3, 4, 5], ArrayScopeListMixin.where(:parent_id => 2, :parent_type => 'something').order(:pos).map(&:pos)
+    assert_equal [1, 2, 3], ArrayScopeListMixin.where(:parent_id => 1, :parent_type => 'anything').order('pos').map(&:pos)
+    assert_equal [1, 2, 3, 4, 5], ArrayScopeListMixin.where(:parent_id => 2, :parent_type => 'something').order('pos').map(&:pos)
   end
 
   def test_order_after_one_scope_property_is_changed
-    assert_equal [1, 2, 3, 4], ArrayScopeListMixin.where(:parent_id => 1, :parent_type => 'anything').order(:pos).map(&:id)
-    assert_equal [9, 10, 11, 12], ArrayScopeListMixin.where(:parent_id => 3, :parent_type => 'anything').order(:pos).map(&:id)
+    assert_equal [1, 2, 3, 4], ArrayScopeListMixin.where(:parent_id => 1, :parent_type => 'anything').order('pos').map(&:id)
+    assert_equal [9, 10, 11, 12], ArrayScopeListMixin.where(:parent_id => 3, :parent_type => 'anything').order('pos').map(&:id)
     ArrayScopeListMixin.find(2).update_attributes(:parent_id => 3, :pos => 2)
-    assert_equal [1, 3, 4], ArrayScopeListMixin.where(:parent_id => 1,:parent_type => 'anything').order(:pos).map(&:id)
-    assert_equal [9, 2, 10, 11, 12], ArrayScopeListMixin.where(:parent_id => 3,:parent_type => 'anything').order(:pos).map(&:id)
+    assert_equal [1, 3, 4], ArrayScopeListMixin.where(:parent_id => 1,:parent_type => 'anything').order('pos').map(&:id)
+    assert_equal [9, 2, 10, 11, 12], ArrayScopeListMixin.where(:parent_id => 3,:parent_type => 'anything').order('pos').map(&:id)
   end
 
   def test_position_after_one_scope_property_is_changed
     assert_equal [1, 2, 3, 4], ArrayScopeListMixin.where(:parent_id => 1, :parent_type => 'anything').map(&:pos)
     assert_equal [1, 2, 3, 4], ArrayScopeListMixin.where(:parent_id => 3, :parent_type => 'anything').map(&:pos)
     ArrayScopeListMixin.find(4).update_attributes(:parent_id => 3, :pos => 2)
-    assert_equal [1, 2, 3], ArrayScopeListMixin.where(:parent_id => 1, :parent_type => 'anything').order(:pos).map(&:pos)
-    assert_equal [1, 2, 3, 4, 5], ArrayScopeListMixin.where(:parent_id => 3, :parent_type => 'anything').order(:pos).map(&:pos)
+    assert_equal [1, 2, 3], ArrayScopeListMixin.where(:parent_id => 1, :parent_type => 'anything').order('pos').map(&:pos)
+    assert_equal [1, 2, 3, 4, 5], ArrayScopeListMixin.where(:parent_id => 3, :parent_type => 'anything').order('pos').map(&:pos)
   end
 
   def test_order_after_moving_to_empty_list
-    assert_equal [1, 2, 3, 4], ArrayScopeListMixin.where(:parent_id => 1, :parent_type => 'anything').order(:pos).map(&:id)
-    assert_equal [], ArrayScopeListMixin.where(:parent_id => 4, :parent_type => 'anything').order(:pos).map(&:id)
+    assert_equal [1, 2, 3, 4], ArrayScopeListMixin.where(:parent_id => 1, :parent_type => 'anything').order('pos').map(&:id)
+    assert_equal [], ArrayScopeListMixin.where(:parent_id => 4, :parent_type => 'anything').order('pos').map(&:id)
     ArrayScopeListMixin.find(2).update_attributes(:parent_id => 4, :pos => 1)
-    assert_equal [1, 3, 4], ArrayScopeListMixin.where(:parent_id => 1,:parent_type => 'anything').order(:pos).map(&:id)
-    assert_equal [2], ArrayScopeListMixin.where(:parent_id => 4,:parent_type => 'anything').order(:pos).map(&:id)
+    assert_equal [1, 3, 4], ArrayScopeListMixin.where(:parent_id => 1,:parent_type => 'anything').order('pos').map(&:id)
+    assert_equal [2], ArrayScopeListMixin.where(:parent_id => 4,:parent_type => 'anything').order('pos').map(&:id)
   end
 
   def test_position_after_moving_to_empty_list
     assert_equal [1, 2, 3, 4], ArrayScopeListMixin.where(:parent_id => 1, :parent_type => 'anything').map(&:pos)
     assert_equal [], ArrayScopeListMixin.where(:parent_id => 4, :parent_type => 'anything').map(&:pos)
     ArrayScopeListMixin.find(2).update_attributes(:parent_id => 4, :pos => 1)
-    assert_equal [1, 2, 3], ArrayScopeListMixin.where(:parent_id => 1, :parent_type => 'anything').order(:pos).map(&:pos)
-    assert_equal [1], ArrayScopeListMixin.where(:parent_id => 4, :parent_type => 'anything').order(:pos).map(&:pos)
+    assert_equal [1, 2, 3], ArrayScopeListMixin.where(:parent_id => 1, :parent_type => 'anything').order('pos').map(&:pos)
+    assert_equal [1], ArrayScopeListMixin.where(:parent_id => 4, :parent_type => 'anything').order('pos').map(&:pos)
+  end
+end
+
+class ArrayScopeListWithHashTest
+  def setup
+    setup_db
+    @obj1 = ArrayScopeListWithHashMixin.create! :pos => counter, :parent_id => 1, :state => nil
+    @obj2 = ArrayScopeListWithHashMixin.create! :pos => counter, :parent_id => 1, :state => 'anything'
+  end
+
+  def test_scope_condition_correct
+    [@obj1, @obj2].each do |obj|
+      assert_equal({ :parent_id => 1, :state => nil }, obj.scope_condition)
+    end
+  end
+end
+
+require 'timecop'
+
+class TouchTest < ActsAsListTestCase
+  def setup
+    setup_db
+    Timecop.freeze(yesterday) do
+      4.times { ListMixin.create! }
+    end
+  end
+
+  def now
+    @now ||= Time.current.change(usec: 0)
+  end
+
+  def yesterday
+    @yesterday ||= 1.day.ago
+  end
+
+  def updated_ats
+    ListMixin.order(:id).pluck(:updated_at)
+  end
+
+  def test_moving_item_lower_touches_self_and_lower_item
+    Timecop.freeze(now) do
+      ListMixin.first.move_lower
+      updated_ats[0..1].each do |updated_at|
+        assert_equal updated_at.to_i, now.to_i
+      end
+      updated_ats[2..3].each do |updated_at|
+        assert_equal updated_at.to_i, yesterday.to_i
+      end
+    end
+  end
+
+  def test_moving_item_higher_touches_self_and_higher_item
+    Timecop.freeze(now) do
+      ListMixin.all.second.move_higher
+      updated_ats[0..1].each do |updated_at|
+        assert_equal updated_at.to_i, now.to_i
+      end
+      updated_ats[2..3].each do |updated_at|
+        assert_equal updated_at.to_i, yesterday.to_i
+      end
+    end
+  end
+
+  def test_moving_item_to_bottom_touches_all_other_items
+    Timecop.freeze(now) do
+      ListMixin.first.move_to_bottom
+      updated_ats.each do |updated_at|
+        assert_equal updated_at.to_i, now.to_i
+      end
+    end
+  end
+
+  def test_moving_item_to_top_touches_all_other_items
+    Timecop.freeze(now) do
+      ListMixin.last.move_to_top
+      updated_ats.each do |updated_at|
+        assert_equal updated_at.to_i, now.to_i
+      end
+    end
+  end
+
+  def test_removing_item_touches_all_lower_items
+    Timecop.freeze(now) do
+      ListMixin.all.third.remove_from_list
+      updated_ats[0..1].each do |updated_at|
+        assert_equal updated_at.to_i, yesterday.to_i
+      end
+      updated_ats[2..2].each do |updated_at|
+        assert_equal updated_at.to_i, now.to_i
+      end
+    end
+  end
+end
+
+class TouchDisabledTest < ActsAsListTestCase
+  def setup
+    setup_db
+    Timecop.freeze(yesterday) do
+      4.times { TouchDisabledMixin.create! }
+    end
+  end
+
+  def now
+    @now ||= Time.current.change(usec: 0)
+  end
+
+  def yesterday
+    @yesterday ||= 1.day.ago
+  end
+
+  def updated_ats
+    TouchDisabledMixin.order(:id).pluck(:updated_at)
+  end
+
+  def positions
+    ListMixin.order(:id).pluck(:pos)
+  end
+
+  def test_deleting_item_does_not_touch_higher_items
+    Timecop.freeze(now) do
+      TouchDisabledMixin.first.destroy
+      updated_ats.each do |updated_at|
+        assert_equal updated_at.to_i, yesterday.to_i
+      end
+      assert_equal positions, [1, 2, 3]
+    end
+  end
+end
+
+class ActsAsListTopTest < ActsAsListTestCase
+  def setup
+    setup_db
+  end
+
+  def test_acts_as_list_top
+    assert_equal 1, TheBaseSubclass.new.acts_as_list_top
+    assert_equal 0, ZeroBasedMixin.new.acts_as_list_top
+  end
+
+  def test_class_acts_as_list_top
+    assert_equal 1, TheBaseSubclass.acts_as_list_top
+    assert_equal 0, ZeroBasedMixin.acts_as_list_top
+  end
+end
+
+class NilPositionTest < ActsAsListTestCase
+  def setup
+    setup_db
+  end
+
+  def test_nil_position_ordering
+    new1 = DefaultScopedMixin.create pos: nil
+    new2 = DefaultScopedMixin.create pos: nil
+    new3 = DefaultScopedMixin.create pos: nil
+    DefaultScopedMixin.update_all(pos: nil)
+
+    assert_equal [nil, nil, nil], DefaultScopedMixin.all.map(&:pos)
+
+    new1.reload.pos = 1
+    new1.save
+
+    new3.reload.pos = 1
+    new3.save
+
+    assert_equal [1, 2], DefaultScopedMixin.where("pos IS NOT NULL").map(&:pos)
+    assert_equal [3, 1], DefaultScopedMixin.where("pos IS NOT NULL").map(&:id)
+    assert_nil new2.reload.pos
+
+    new2.reload.pos = 1
+    new2.save
+
+    assert_equal [1, 2, 3], DefaultScopedMixin.all.map(&:pos)
+    assert_equal [2, 3, 1], DefaultScopedMixin.all.map(&:id)
+  end
+end
+
+class SequentialUpdatesOptionDefaultTest < ActsAsListTestCase
+  def setup
+    setup_db
+  end
+
+  def test_sequential_updates_default_to_false_without_unique_index
+    assert_equal false, SequentialUpdatesDefault.new.send(:sequential_updates?)
+  end
+end
+
+class SequentialUpdatesMixinNotNullUniquePositiveConstraintsTest < ActsAsListTestCase
+  def setup
+    setup_db null: false, unique: true, positive: true
+    (1..4).each { |counter| SequentialUpdatesDefault.create!({pos: counter}) }
+  end
+
+  def test_sequential_updates_default_to_true_with_unique_index
+    assert_equal true, SequentialUpdatesDefault.new.send(:sequential_updates?)
+  end
+
+  def test_sequential_updates_option_override_with_false
+    assert_equal false, SequentialUpdatesFalseMixin.new.send(:sequential_updates?)
+  end
+
+  def test_insert_at
+    new = SequentialUpdatesDefault.create
+    assert_equal 5, new.pos
+
+    new.insert_at(1)
+    assert_equal 1, new.pos
+
+    new.insert_at(5)
+    assert_equal 5, new.pos
+
+    new.insert_at(3)
+    assert_equal 3, new.pos
+  end
+
+  def test_move_to_bottom
+    item = SequentialUpdatesDefault.order(:pos).first
+    item.move_to_bottom
+    assert_equal 4, item.pos
+  end
+
+  def test_move_to_top
+    new_item = SequentialUpdatesDefault.create!
+    assert_equal 5, new_item.pos
+
+    new_item.move_to_top
+    assert_equal 1, new_item.pos
+  end
+
+  def test_destroy
+    new_item = SequentialUpdatesDefault.create
+    assert_equal 5, new_item.pos
+
+    new_item.insert_at(2)
+    assert_equal 2, new_item.pos
+
+    new_item.destroy
+    assert_equal [1,2,3,4], SequentialUpdatesDefault.all.map(&:pos).sort
+
+  end
+
+  def test_exception_on_wrong_position
+    new_item = SequentialUpdatesDefault.create
+
+    assert_raises ArgumentError do
+      new_item.insert_at(0)
+    end
+  end
+
+
+  class SequentialUpdatesMixinNotNullUniquePositiveConstraintsTest < ActsAsListTestCase
+    def setup
+      setup_db null: false, unique: true, positive: true
+      (1..4).each { |counter| SequentialUpdatesAltId.create!({pos: counter}) }
+    end
+
+    def test_sequential_updates_default_to_true_with_unique_index
+      assert_equal true, SequentialUpdatesAltId.new.send(:sequential_updates?)
+    end
+
+    def test_insert_at
+      new = SequentialUpdatesAltId.create
+      assert_equal 5, new.pos
+
+      new.insert_at(1)
+      assert_equal 1, new.pos
+
+      new.insert_at(5)
+      assert_equal 5, new.pos
+
+      new.insert_at(3)
+      assert_equal 3, new.pos
+    end
+
+    def test_move_to_bottom
+      item = SequentialUpdatesAltId.order(:pos).first
+      item.move_to_bottom
+      assert_equal 4, item.pos
+    end
+
+    def test_move_to_top
+      new_item = SequentialUpdatesAltId.create!
+      assert_equal 5, new_item.pos
+
+      new_item.move_to_top
+      assert_equal 1, new_item.pos
+    end
+
+    def test_destroy
+      new_item = SequentialUpdatesAltId.create
+      assert_equal 5, new_item.pos
+
+      new_item.insert_at(2)
+      assert_equal 2, new_item.pos
+
+      new_item.destroy
+      assert_equal [1,2,3,4], SequentialUpdatesAltId.all.map(&:pos).sort
+
+    end
+  end
+
+  class SequentialUpdatesAltIdTouchDisabledTest < ActsAsListTestCase
+    def setup
+      setup_db
+      Timecop.freeze(yesterday) do
+        4.times { SequentialUpdatesAltIdTouchDisabled.create! }
+      end
+    end
+
+    def now
+      @now ||= Time.current.change(usec: 0)
+    end
+
+    def yesterday
+      @yesterday ||= 1.day.ago
+    end
+
+    def updated_ats
+      SequentialUpdatesAltIdTouchDisabled.order(:altid).pluck(:updated_at)
+    end
+
+    def positions
+      SequentialUpdatesAltIdTouchDisabled.order(:altid).pluck(:pos)
+    end
+
+    def test_sequential_updates_default_to_true_with_unique_index
+      assert_equal true, SequentialUpdatesAltIdTouchDisabled.new.send(:sequential_updates?)
+    end
+
+    def test_deleting_item_does_not_touch_higher_items
+      Timecop.freeze(now) do
+        SequentialUpdatesAltIdTouchDisabled.first.destroy
+        updated_ats.each do |updated_at|
+          assert_equal updated_at.to_i, yesterday.to_i
+        end
+        assert_equal positions, [1, 2, 3]
+      end
+    end
   end
 end
